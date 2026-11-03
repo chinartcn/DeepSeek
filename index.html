@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeepSeek 分享对话 → Markdown / HTML</title>
+<style>
+  :root{--bg:#f4f5f7;--panel:#fff;--border:#e4e7ec;--text:#1c1f23;--muted:#697386;--accent:#4d6bfe;--code-bg:#f2f4f7}
+  @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--panel:#171a1f;--border:#2a2f38;--text:#e6e9ee;--muted:#98a2b3;--accent:#7b93ff;--code-bg:#11141a}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  header{padding:18px 24px;border-bottom:1px solid var(--border);background:var(--panel)}
+  header h1{margin:0;font-size:17px}
+  header p{margin:4px 0 0;color:var(--muted);font-size:13px}
+  main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px;height:calc(100vh - 92px)}
+  @media (max-width:900px){main{grid-template-columns:1fr;height:auto}}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+         padding:14px;display:flex;flex-direction:column;gap:10px;min-height:0}
+  .panel h2{margin:0;font-size:13px;color:var(--muted);font-weight:600;letter-spacing:.02em}
+  textarea{flex:1;min-height:240px;resize:none;border:1px solid var(--border);border-radius:8px;
+           background:var(--bg);color:var(--text);padding:10px;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  textarea:focus{outline:2px solid color-mix(in srgb,var(--accent) 40%,transparent);outline-offset:0}
+  iframe{flex:1;min-height:240px;border:1px solid var(--border);border-radius:8px;background:#fff;display:none}
+  .row{display:flex;gap:8px;flex-wrap:wrap}
+  button,.btn{border:1px solid var(--border);background:var(--bg);color:var(--text);
+              padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px;transition:.15s}
+  button:hover,.btn:hover{border-color:var(--accent);color:var(--accent)}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button.primary:hover{filter:brightness(1.08);color:#fff}
+  .tabs{display:flex;gap:6px}
+  .tab{padding:5px 12px;border-radius:8px;font-size:13px;border:1px solid transparent;background:transparent}
+  .tab.active{background:var(--bg);border-color:var(--border);font-weight:600}
+  .hidden{display:none!important}
+  #status{font-size:12px;color:var(--muted);min-height:18px}
+  #status.err{color:#e5484d}
+</style>
+</head>
+<body>
+<header>
+  <h1>DeepSeek 分享对话 → Markdown / HTML</h1>
+  <p>把 <code>share/content?share_id=…</code> 返回的 JSON 粘贴进来，一键导出</p>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>① 原始 JSON</h2>
+    <textarea id="input" spellcheck="false" placeholder='{"code":0,"msg":"","data":{"biz_code":0,...}}'></textarea>
+    <div class="row">
+      <label class="btn">选择 .json 文件<input type="file" id="file" accept=".json,.txt" hidden></label>
+      <button id="parse" class="primary">解析</button>
+      <button id="demo">载入示例</button>
+    </div>
+    <div id="status"></div>
+  </section>
+
+  <section class="panel">
+    <div class="tabs">
+      <button class="tab active" data-tab="md">Markdown</button>
+      <button class="tab" data-tab="html">HTML 预览</button>
+    </div>
+    <textarea id="mdOut" class="out" spellcheck="false" placeholder="解析后这里显示 Markdown…"></textarea>
+    <iframe id="htmlOut" class="out" sandbox="allow-same-origin"></iframe>
+    <div class="row">
+      <button id="copyMd">复制 Markdown</button>
+      <button id="dlMd">下载 .md</button>
+      <button id="dlHtml" class="primary">下载 .html</button>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+/* ============ 基础工具 ============ */
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+function fmtTime(sec){
+  if (!sec) return '';
+  const d = new Date(sec * 1000), p = n => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/* Markdown → HTML（marked 不可用时降级为 <pre>） */
+function md2html(md){
+  try{
+    if (window.marked) return marked.parse(md, {breaks:true, gfm:true});
+  }catch(e){}
+  return '<pre style="white-space:pre-wrap">' + esc(md) + '</pre>';
+}
+
+/* ============ 1. 解析 JSON ============ */
+function parseConversation(raw){
+  const json = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  const biz = json?.data?.biz_data ?? json?.biz_data ?? json?.data;
+  if (!biz || !Array.isArray(biz.messages))
+    throw new Error('未找到 messages 字段，请确认粘贴的是 share/content 接口返回的完整 JSON');
+
+  const msgs = [...biz.messages].sort((a,b) => (a.message_id ?? 0) - (b.message_id ?? 0));
+
+  const turns = msgs.map(m => {
+    const frags = Array.isArray(m.fragments) ? m.fragments : [];
+    const by   = t => frags.filter(f => f.type === t);
+    const join = t => by(t).map(f => f.content ?? '').filter(Boolean).join('\n\n');
+
+    const refs = [];
+    for (const f of frags) if (Array.isArray(f.references)) refs.push(...f.references);
+
+    return {
+      id: m.message_id,
+      role: (m.role || '').toUpperCase(),
+      model: m.model || '',
+      time: m.inserted_at,
+      status: m.status || '',
+      tokens: m.accumulated_token_usage || 0,
+      request: join('REQUEST'),
+      think: join('THINK'),
+      thinkSecs: by('THINK').reduce((s,f) => s + (f.elapsed_secs || 0), 0),
+      response: join('RESPONSE'),
+      references: refs,
+    };
+  });
+
+  return {
+    title: biz.title || '分享的对话',
+    modelType: biz.model_type || '',
+    turns,
+  };
+}
+
+/* 引用条目格式化 */
+function refInfo(r){
+  const url   = r?.url || r?.link || r?.href || '';
+  const title = r?.title || r?.name || r?.site_name || url || '来源';
+  return { url, title };
+}
+
+/* ============ 2. 生成 Markdown ============ */
+function toMarkdown(conv){
+  const L = [`# ${conv.title}`, ''];
+
+  const times = conv.turns.map(t => t.time).filter(Boolean);
+  const meta = [`消息数：${conv.turns.length}`];
+  if (conv.modelType) meta.push(`模型：${conv.modelType}`);
+  if (times.length)   meta.push(`时间：${fmtTime(Math.min(...times))} ~ ${fmtTime(Math.max(...times))}`);
+  meta.push(`导出：${fmtTime(Date.now()/1000)}`);
+  L.push(`> ${meta.join(' · ')}`, '');
+
+  for (const t of conv.turns){
+    if (t.role === 'USER'){
+      L.push('---', '', '## 🧑 用户', '');
+      if (t.time) L.push(`*${fmtTime(t.time)}*`, '');
+      L.push((t.request || '').trim() || '_(空)_', '');
+    } else {
+      L.push('---', '', t.model ? `## 🤖 助手 · ${t.model}` : '## 🤖 助手', '');
+      if (t.time) L.push(`*${fmtTime(t.time)}*`, '');
+
+      if (t.think){
+        const dur = t.thinkSecs ? `（${t.thinkSecs.toFixed(2)}s）` : '';
+        L.push('<details>', `<summary>💭 思考过程${dur}</summary>`, '', t.think.trim(), '', '</details>', '');
+      }
+
+      L.push((t.response || '').trim() || '_(空)_', '');
+
+      if (t.references.length){
+        L.push('**参考来源**', '');
+        t.references.forEach((r, i) => {
+          const {url, title} = refInfo(r);
+          L.push(url ? `${i+1}. [${title}](${url})` : `${i+1}. ${title}`);
+        });
+        L.push('');
+      }
+    }
+  }
+  return L.join('\n').replace(/\n{4,}/g, '\n\n\n').trim() + '\n';
+}
+
+/* ============ 3. 生成独立 HTML 文档 ============ */
+function toHtmlDocument(conv){
+  const rows = conv.turns.map(t => {
+    const isUser = t.role === 'USER';
+    const avatar = isUser ? '🧑' : '🤖';
+
+    const meta = [isUser ? '你' : 'DeepSeek'];
+    if (!isUser && t.model) meta.push(t.model);
+    if (t.time)   meta.push(fmtTime(t.time));
+    if (t.tokens) meta.push(`${t.tokens} tokens`);
+
+    const think = (!isUser && t.think) ? `
+        <details class="think">
+          <summary>💭 思考过程${t.thinkSecs ? ` · ${t.thinkSecs.toFixed(2)}s` : ''}</summary>
+          <div class="think-body">${md2html(t.think.trim())}</div>
+        </details>` : '';
+
+    const content = (isUser ? t.request : t.response) || '';
+
+    const refs = (!isUser && t.references.length) ? `
+        <div class="refs">
+          <div class="refs-title">参考来源</div>
+          <ol>${t.references.map(r => {
+            const {url, title} = refInfo(r);
+            return `<li>${url
+              ? `<a href="${esc(url)}" target="_blank" rel="noopener">${esc(title)}</a>`
+              : esc(title)}</li>`;
+          }).join('')}</ol>
+        </div>` : '';
+
+    return `
+      <div class="msg ${isUser ? 'user' : 'assistant'}">
+        <div class="avatar">${avatar}</div>
+        <div class="main">
+          <div class="meta">${esc(meta.join(' · '))}</div>
+          ${think}
+          <div class="content">${md2html(content.trim()) || '<p class="empty">（空）</p>'}</div>
+          ${refs}
+        </div>
+      </div>`;
+  }).join('\n');
+
+  const times = conv.turns.map(t => t.time).filter(Boolean);
+  const sub = [
+    `${conv.turns.length} 条消息`,
+    times.length ? `${fmtTime(Math.min(...times))} ~ ${fmtTime(Math.max(...times))}` : '',
+    `导出于 ${fmtTime(Date.now()/1000)}`,
+  ].filter(Boolean).join(' · ');
+
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(conv.title)}</title>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--border:#e4e7ec;--text:#1c1f23;--muted:#697386;--accent:#4d6bfe;--code-bg:#f2f4f7}
+  @media (prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a1f;--border:#2a2f38;--text:#e6e9ee;--muted:#98a2b3;--accent:#7b93ff;--code-bg:#11141a}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);line-height:1.75;
+       font:15px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  .page{max-width:860px;margin:0 auto;padding:32px 20px 64px}
+  header{border-bottom:1px solid var(--border);padding-bottom:18px;margin-bottom:26px}
+  header h1{margin:0 0 6px;font-size:22px;line-height:1.35}
+  header .sub{margin:0;color:var(--muted);font-size:13px}
+  .msg{display:flex;gap:12px;margin-bottom:22px;align-items:flex-start}
+  .avatar{flex:0 0 34px;width:34px;height:34px;border-radius:50%;display:grid;place-items:center;
+          font-size:17px;background:var(--code-bg);border:1px solid var(--border)}
+  .msg.user .avatar{background:color-mix(in srgb,var(--accent) 18%,transparent)}
+  .main{flex:1;min-width:0;background:var(--card);border:1px solid var(--border);
+        border-radius:12px;padding:14px 16px}
+  .msg.user .main{background:color-mix(in srgb,var(--accent) 7%,var(--card))}
+  .meta{font-size:12px;color:var(--muted);margin-bottom:8px}
+  .content>*:first-child{margin-top:0}
+  .content>*:last-child{margin-bottom:0}
+  .content p{margin:.6em 0}
+  .content pre{background:var(--code-bg);padding:12px 14px;border-radius:8px;overflow:auto;font-size:13px}
+  .content code{background:var(--code-bg);padding:2px 5px;border-radius:4px;font-size:.9em;
+                font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .content pre code{background:none;padding:0}
+  .content table{border-collapse:collapse;width:100%;margin:10px 0;font-size:14px}
+  .content th,.content td{border:1px solid var(--border);padding:6px 10px;text-align:left}
+  .content th{background:var(--code-bg)}
+  .content blockquote{margin:.6em 0;padding:.2em 0 .2em 12px;border-left:3px solid var(--border);color:var(--muted)}
+  .content img{max-width:100%}
+  .content a{color:var(--accent)}
+  .think{margin:6px 0 12px;border:1px dashed var(--border);border-radius:8px;
+         padding:8px 12px;background:var(--code-bg)}
+  .think summary{cursor:pointer;color:var(--muted);font-size:13px;user-select:none}
+  .think-body{margin-top:10px;font-size:13.5px;color:var(--muted);white-space:normal}
+  .refs{margin-top:14px;padding-top:12px;border-top:1px solid var(--border);font-size:13px}
+  .refs-title{color:var(--muted);margin-bottom:6px}
+  .refs ol{margin:0;padding-left:20px}
+  .empty{color:var(--muted)}
+  footer{margin-top:40px;text-align:center;color:var(--muted);font-size:12px}
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <h1>${esc(conv.title)}</h1>
+    <p class="sub">${esc(sub)}</p>
+  </header>
+  <main>${rows}</main>
+  <footer>由 DeepSeek 分享对话导出器生成</footer>
+</div>
+</body>
+</html>`;
+}
+
+/* ============ 4. 界面交互 ============ */
+let lastMd = '', lastHtml = '';
+
+function setStatus(msg, isErr){
+  const el = $('status');
+  el.textContent = msg || '';
+  el.className = isErr ? 'err' : '';
+}
+
+function run(){
+  const raw = $('input').value.trim();
+  if (!raw) return setStatus('请先粘贴 JSON', true);
+  try{
+    const conv = parseConversation(raw);
+    lastMd   = toMarkdown(conv);
+    lastHtml = toHtmlDocument(conv);
+
+    $('mdOut').value = lastMd;
+    $('htmlOut').srcdoc = lastHtml;
+
+    setStatus(`✅ 解析成功：${conv.turns.length} 条消息`);
+  }catch(e){
+    setStatus('❌ ' + e.message, true);
+  }
+}
+
+/* Tab 切换 */
+document.querySelectorAll('.tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    const isMd = tab.dataset.tab === 'md';
+    $('mdOut').classList.toggle('hidden', !isMd);
+    $('htmlOut').classList.toggle('hidden', isMd);
+    $('htmlOut').style.display = isMd ? 'none' : 'block';
+  });
+});
+
+/* 按钮 */
+$('parse').addEventListener('click', run);
+
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => { $('input').value = r.result; run(); };
+  r.readAsText(f, 'utf-8');
+});
+
+$('copyMd').addEventListener('click', async () => {
+  if (!lastMd) return setStatus('还没有可复制的内容', true);
+  try{
+    await navigator.clipboard.writeText(lastMd);
+    setStatus('📋 已复制 Markdown');
+  }catch(e){
+    $('mdOut').select(); document.execCommand('copy');
+    setStatus('📋 已复制 Markdown');
+  }
+});
+
+function download(filename, text, mime){
+  const blob = new Blob([text], {type: mime + ';charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+const safeName = () => {
+  const t = ($('input').value.match(/"title"\s*:\s*"((?:[^"\\]|\\.)*)"/) || [])[1];
+  return (t || 'deepseek-conversation').replace(/[\\/:*?"<>|]/g, '_').slice(0, 60);
+};
+
+$('dlMd').addEventListener('click', () => {
+  if (!lastMd) return setStatus('请先解析', true);
+  download(safeName() + '.md', lastMd, 'text/markdown');
+});
+
+$('dlHtml').addEventListener('click', () => {
+  if (!lastHtml) return setStatus('请先解析', true);
+  download(safeName() + '.html', lastHtml, 'text/html');
+});
+
+/* 示例 */
+$('demo').addEventListener('click', () => {
+  $('input').value = `{"code":0,"msg":"","data":{"biz_code":0,"biz_msg":"","biz_data":{"title":"Shared Conversation","messages":[{"message_id":1,"parent_id":null,"model":"","role":"USER","inserted_at":1793697704.539,"accumulated_token_usage":59,"search_enabled":true,"fragments":[{"id":1,"type":"REQUEST","content":"ABC "}]},{"message_id":2,"parent_id":1,"model":"","role":"ASSISTANT","inserted_at":1793697704.537,"accumulated_token_usage":88,"fragments":[{"id":2,"type":"THINK","content":"用户只说 ABC，应该询问需要什么。","elapsed_secs":1.063,"references":[]},{"id":3,"type":"RESPONSE","content":"你输入的“ABC”信息比较少。请问你想让我帮你做什么？","references":[]}]}],"model_type":"default"}}}`;
+  run();
+});
+</script>
+</body>
+</html>
